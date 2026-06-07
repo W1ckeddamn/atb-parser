@@ -1,12 +1,27 @@
+"""ATB Market parser - synchronous and asynchronous product catalog scrapers."""
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 import httpx
 import time
 from fake_useragent import UserAgent
 import json
-import asyncio     
+import asyncio
+from difflib import get_close_matches
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('parser.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 def load_config(config_path: str = "config.json") -> dict:
+    """Load parser configuration from JSON file or return defaults."""
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -44,44 +59,75 @@ def load_config(config_path: str = "config.json") -> dict:
                     "Тютюнові вироби": "479-tyutyunovi-virobi",
                     "Сертифікати та платіжні картки": "sertifikati-ta-platizni-kartki",
                     "Канцелярські товари": "389-kantselyars-ki-tovari"
-            }
+            },
+            "database_type": "sqlite",  # sqlite или postgres
+            "db_host": "localhost",
+            "db_port": "5432",
+            "db_name": "atb_prices",
+            "db_user": "postgres",
+            "db_password": "password"
         }
 
 CONFIG = load_config()
 
 class ATBparser:
+    """Synchronous parser for ATB Market product catalog."""
+
     def __init__(self):
+        """Initialize parser with base URLs and categories from config."""
         self.base_url: str = CONFIG["base_url"]
         self.base_url_catalog: str = CONFIG["base_url_catalog"]
         self.categories: dict[str, str] = CONFIG["categories"]
         self.ua = UserAgent(browsers=['chrome', 'edge', 'firefox'])
     
     def _get_headers(self) -> dict:
-        """Генерирует свежие заголовки со случайным живым User-Agent"""
+        """Generate request headers with random User-Agent."""
         return {
             "User-Agent": self.ua.random,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.atbmarket.com/",
         }
-        
-    def choose_category(self):
+
+    def choose_category_by_number(self):
+        """Interactive category selection by number."""
         print("Choose category:")
         for i, (name, _) in enumerate(self.categories.items(), start=1):
             print(f"{i}. {name}")
-            
+
         category_index: int = int(input("Enter category number: "))
         category_name: str = list(self.categories.keys())[category_index - 1]
         category_slug: str = self.categories[category_name]
         return category_slug
-    
+
+    def search_category(self, query):
+        """Find category slug by fuzzy matching query against names and slugs."""
+        matches = get_close_matches(
+            query.lower(),
+            [name.lower() for name in self.categories.keys()] +
+            [slug.lower() for slug in self.categories.values()],
+            n=1,
+            cutoff=0.6
+        )
+        if not matches:
+          print(f"No category found for '{query}'")
+          return
+
+        for name, slug in self.categories.items():
+            if name.lower() == matches[0]:
+              print(f"Matched: {name}")
+              return slug
+            if slug.lower() == matches[0]:
+              print(f"Matched: {name}")
+              return slug
     
     def parse_atb_markup(self, html_markup: str) -> list[dict]:
+        """Parse product cards from HTML markup and extract structured data."""
         soup = BeautifulSoup(html_markup, "lxml")
         products_list = []
-        
+
         cards = soup.find_all("article", class_="catalog-item")
-        
+
         for card in cards:
             try:
                 cart_btn = card.find("div", class_="b-addToCart")
@@ -125,7 +171,8 @@ class ATBparser:
                 
         return products_list
             
-    def search_product(self, query: str):        
+    def roug_search_product(self, query: str):
+        """Search products using ATB's multisearch API."""
         with httpx.Client() as client:
             url = f"https://api.multisearch.io/"
             params = {
@@ -140,10 +187,11 @@ class ATBparser:
                 "uid": "de33cf30-d4ad-4486-ae87-1cbd6237ed58"
             }
             r = client.get(url, headers=self._get_headers(), params=params)
-            
+
             return r.json()
-        
+
     def parse_category(self, category_slug: str, start_page: int = 1) -> list[dict]:
+        """Parse all products from category synchronously, page by page."""
         with httpx.Client() as client:
             all_products = []                                                   
             url = urljoin(self.base_url_catalog, category_slug)
@@ -167,24 +215,37 @@ class ATBparser:
             return all_products
 
 class AsyncATBparser(ATBparser):
-    def __init__(self):
+    """Asynchronous parser for ATB Market - fetches multiple pages concurrently."""
+
+    def __init__(self, rate_limit_delay: float = 0.3):
+        """Initialize async parser with parent class settings.
+
+        Args:
+            rate_limit_delay: Delay in seconds between requests (default 0.3s)
+        """
         super().__init__()
-    
+        self.rate_limit_delay = rate_limit_delay
+
     async def fetch_page(self, client: httpx.AsyncClient, url: str, page: int) -> tuple[int, list[dict]]:
+        """Fetch single page and return page count + parsed products."""
         try:
+            # Rate limiting
+            await asyncio.sleep(self.rate_limit_delay)
+
             headers = self._get_headers()
             r = await client.get(url, headers=headers, params={"page": page})
             response = r.json()
             markup = response.get("markup", "")
             page_count = response.get("page_count", 1)
-            
+
             products = self.parse_atb_markup(markup)
             return page_count, products
         except Exception as e:
             print(f"Ошибка при скачивании страницы {page}: {e}")
             return 1, []
-            
+
     async def parse_category(self, category_slug: str, page: int = 1) -> list[dict[str, str]]:
+        """Parse all products from category asynchronously, fetching pages in parallel."""
         all_products = []
         url = urljoin(self.base_url_catalog, category_slug)
         async with httpx.AsyncClient() as client:
